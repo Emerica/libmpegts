@@ -210,6 +210,11 @@ static void add_to_buffer( buffer_t *buffer )
 
 static void drip_buffer( ts_writer_t *w, ts_int_program_t *program, int rx, buffer_t *buffer, double next_pcr )
 {
+    int iters;
+    double offset;
+
+    /* Although this uses floating point arithmetic, the values are backed by integers
+     * Transport buffer fullness does not need to be exact */
     double cur_pcr = TS_START + w->packets_written * 8.0 * TS_PACKET_SIZE / w->ts_muxrate;
     if( buffer->last_byte_removal_time == 0.0 )
     {
@@ -217,11 +222,12 @@ static void drip_buffer( ts_writer_t *w, ts_int_program_t *program, int rx, buff
         buffer->cur_buf -= 8;
     }
 
-    while( buffer->last_byte_removal_time + (8.0 / rx) < next_pcr )
-    {
-        buffer->cur_buf -= 8;
-        buffer->last_byte_removal_time += 8.0 / rx;
-    }
+    iters = floor( (next_pcr - buffer->last_byte_removal_time) / (8.0 / rx) );
+
+    buffer->cur_buf -= 8*iters;
+    /* Avoid compounded error from floating point addition by making calculations relative to next_pcr */
+    offset = next_pcr - (buffer->last_byte_removal_time + 8.0 * iters / rx);
+    buffer->last_byte_removal_time = next_pcr - offset;
 
     buffer->cur_buf = MAX( buffer->cur_buf, 0 );
 }
@@ -238,7 +244,6 @@ static int write_adaptation_field( ts_writer_t *w, bs_t *s, ts_int_program_t *pr
     int start = bs_pos( s );
     uint8_t temp[512], temp2[256];
     bs_t q, r;
-    int64_t pcr = get_pcr( w, 7 ); /* 7 bytes until end of PCR field */
 
     private_data_flag = write_dvb_au = random_access = priority = 0;
 
@@ -246,11 +251,17 @@ static int write_adaptation_field( ts_writer_t *w, bs_t *s, ts_int_program_t *pr
     {
         ts_int_stream_t *stream = pes->stream;
         random_access = pes->random_access;
+        if( IS_VIDEO( stream ) )
+        {
+            if( !write_pcr )
+                random_access = 0;
+
+            if( stream->dvb_au )
+                private_data_flag = write_dvb_au = 1;
+        }
+
         priority = pes->priority;
         pes->random_access = 0; /* don't write this flag again */
-
-        if( stream->dvb_au && ( stream->stream_format == LIBMPEGTS_VIDEO_MPEG2 || stream->stream_format == LIBMPEGTS_VIDEO_AVC ) )
-            private_data_flag = write_dvb_au = 1;
     }
 
     /* initialise temporary bitstream */
@@ -258,6 +269,7 @@ static int write_adaptation_field( ts_writer_t *w, bs_t *s, ts_int_program_t *pr
 
     if( flags )
     {
+        int64_t pcr = get_pcr( w, 7 ); /* 7 bytes until end of PCR field */
         bs_write1( &q, discontinuity ); // discontinuity_indicator
         bs_write1( &q, random_access ); // random_access_indicator
         bs_write1( &q, priority );  // elementary_stream_priority_indicator
@@ -1060,12 +1072,12 @@ int ts_setup_mpegvideo_stream( ts_writer_t *w, int pid, int level, int profile, 
 
     if( stream->stream_format == LIBMPEGTS_VIDEO_MPEG2 )
     {
-        if( level < MPEG2_LEVEL_LOW || level > MPEG2_LEVEL_HIGHP )
+        if( level < LIBMPEGTS_MPEG2_LEVEL_LOW || level > LIBMPEGTS_MPEG2_LEVEL_HIGHP )
         {
             fprintf( stderr, "Invalid MPEG-2 Level\n" );
             return -1;
         }
-        if( profile < MPEG2_PROFILE_SIMPLE || profile > MPEG2_PROFILE_422 )
+        if( profile < LIBMPEGTS_MPEG2_PROFILE_SIMPLE || profile > LIBMPEGTS_MPEG2_PROFILE_422 )
         {
             fprintf( stderr, "Invalid MPEG-2 Profile\n" );
             return -1;
@@ -1126,7 +1138,7 @@ int ts_setup_mpegvideo_stream( ts_writer_t *w, int pid, int level, int profile, 
         stream->rx = 1.2 * mpeg2_levels[level_idx].bitrate;
         stream->eb.buf_size = vbv_bufsize;
 
-        if( level == MPEG2_LEVEL_LOW || level == MPEG2_LEVEL_MAIN )
+        if( level == LIBMPEGTS_MPEG2_LEVEL_LOW || level == LIBMPEGTS_MPEG2_LEVEL_MAIN )
         {
             stream->mb.buf_size = bs_mux + bs_oh + mpeg2_levels[level_idx].vbv - vbv_bufsize;
             stream->rbx = mpeg2_levels[level_idx].bitrate;
@@ -1550,15 +1562,15 @@ int ts_write_frames( ts_writer_t *w, ts_frame_t *frames, int num_frames, uint8_t
             new_pes[i]->pic_struct = frames[i].pic_struct;
         }
         else if( stream->stream_format == LIBMPEGTS_DVB_TELETEXT )
-            new_pes[i]->initial_arrival_time = (queued_pes[i]->dts - 3600) * 300; /* Teletext is special because data can only stay in the buffer for 40ms */
+            new_pes[i]->initial_arrival_time = (new_pes[i]->dts - 3600) * 300; /* Teletext is special because data can only stay in the buffer for 40ms */
         else if( stream->stream_format == LIBMPEGTS_DVB_SUB )
             new_pes[i]->initial_arrival_time = 0; /* FIXME: is this right? */
         else if( stream->stream_format == LIBMPEGTS_DVB_VBI && ( w->ts_type == TS_TYPE_CABLELABS || w->ts_type == TS_TYPE_ATSC ) )
-            new_pes[i]->initial_arrival_time = (queued_pes[i]->dts - 3003) * 300; /* SCTE-127 VBI is always in terms of NTSC */
+            new_pes[i]->initial_arrival_time = (new_pes[i]->dts - 3003) * 300; /* SCTE-127 VBI is always in terms of NTSC */
         else if( stream->stream_format == LIBMPEGTS_DVB_VBI )
-            new_pes[i]->initial_arrival_time = (queued_pes[i]->dts - 3600) * 300;
+            new_pes[i]->initial_arrival_time = (new_pes[i]->dts - 3600) * 300;
         else
-            new_pes[i]->initial_arrival_time = (queued_pes[i]->dts - stream->max_frame_size) * 300; /* earliest that a frame can arrive */
+            new_pes[i]->initial_arrival_time = (new_pes[i]->dts - stream->max_frame_size) * 300; /* earliest that a frame can arrive */
 
         /* probe the first normal looking ac3 frame if extra data is needed */
         if( !stream->atsc_ac3_ctx && stream->stream_format == LIBMPEGTS_AUDIO_AC3 &&
@@ -1698,22 +1710,21 @@ int ts_write_frames( ts_writer_t *w, ts_frame_t *frames, int num_frames, uint8_t
 #endif
             bs_init( &q, temp, 150 );
 
-            /* It is good practice to write a pcr at the beginning of a video payload, and allows the packet to be
-             * a random access indicator if applicable */
             if( program->pcr_stream == stream && pes_start )
-                write_pcr = 1;
-            else if( check_pcr( w, program ) )
+                write_adapt_field = 1;
+
+            if( check_pcr( w, program ) )
             {
                 if( program->pcr_stream == stream )
                 {
                     /* piggyback pcr on this stream */
-                    write_pcr = 1;
+                    write_adapt_field = write_pcr = 1;
                 }
                 else if( write_pcr_empty( w, program, 0 ) < 0 )
                     return -1;
             }
 
-            if( write_pcr )
+            if( write_adapt_field )
             {
                 adapt_field_len = write_adaptation_field( w, &q, program, pes, write_pcr, 1, 0, 0 );
                 pkt_bytes_left -= adapt_field_len;
